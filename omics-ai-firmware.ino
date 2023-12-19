@@ -11,21 +11,6 @@
 //   NEO_RGBW    Pixels are wired for RGBW bitstream (NeoPixel RGBW products)
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-enum Mode { AUTO, SINGLE };
-Mode mode = AUTO;
-
-void setup() {
-  strip.begin();
-  strip.show(); // ensure pixels don't come on at 100% white (mega power draw)
-  strip.setBrightness(50); // (max = 255)
-
-  Serial.begin(9600);
-  while (!Serial) {
-    ;  // wait for serial port to connect. Needed for native USB port only
-  }
-
-}
-
 // ------ Maps of pixels by physical position
 static const uint8_t ENDROW = 255;
 
@@ -60,139 +45,209 @@ static const uint8_t OMICS_LAST_LED = 24;
 //static const uint32_t AI_PURPLE_HSV = 0xadc8e3; // "true" RGB is #4d51e5 = 238deg, 66%, 90% = hsv(a8,a9,e5) but this looks closer to me
 static const uint32_t AI_PURPLE_HSV = 0xa8a9e5; 
 
-// two buffers for the scene, both in packed HSV 8,8,8
-uint32_t scene1[LED_COUNT];
-uint32_t scene2[LED_COUNT];
 
-void loop() {
-  if (Serial.available() > 0) {
-    processSerial();
+// PixelAnimator implementations -----------------
+class PixelAnimator {
+  uint8_t frameDelay{0};
+  bool keepRunning{true};
+  const uint8_t frameSkip;
+
+  protected:
+  PixelAnimator(const uint8_t frameSkip) : frameSkip(frameSkip) {}
+
+  public:
+
+  /**
+   * Handles frameSkip/frameDelay, and calls update() when it's time.
+   *
+   * Returns false when the animation cycle is nearing an end, and the transition
+   * to some other animator should begin. Otherwise returns true to say "keep
+   * calling me back." This is done by caching the last value returned by update().
+   */
+  bool nextFrame(uint32_t *scene) {
+    if (frameDelay > 0) {
+      frameDelay--;
+    } else {
+      frameDelay = frameSkip;
+      keepRunning = update(scene);
+    }
+    return keepRunning;
   }
 
-  if (mode == AUTO) {
-    // choose random effect and run it on scene 1
-    switch (random(4)) {
-      case 0:
-        rainbow(scene1, 10);
-        break;
-      case 1:
-        aiColorSparkle(scene1, 50);
-        break;
-      case 2:
-        seriesFill(scene1, 0x00ffff, 50); // Red
-        seriesFill(scene1, 0x55ffff, 50); // Green
-        seriesFill(scene1, 0xaaffff, 50); // Blue
-        break;
-      case 3:
-        geomFill(scene1, Y, 0x00ffff, 100);
-        geomFill(scene1, Y, 0x33ffff, 100);
-        geomFill(scene1, Y, 0x66ffff, 100);
-        geomFill(scene1, Y, 0x99ffff, 100);
-        geomFill(scene1, Y, 0xccffff, 100);
-        break;
-    }
+  /**
+   * Applies this animation's next actual frame to the given scene. Does not necessarily
+   * write all pixels, but typically will.
+   *
+   * Returns false when the animation cycle is nearing an end, and the transition
+   * to some other animator should begin. Otherwise returns true to say "keep
+   * calling me back."
+   */
+  virtual bool update(uint32_t *scene);
 
-    // choose random wipe to reveal scene 2 (the proper logo colours)
-    fillSceneOmics(scene2, 0xa800ff);
-    fillSceneAi(scene2, AI_PURPLE_HSV);
-    bool doDelay = true;
-    switch (random(5)) {
-      case 0:
-        transitionWipe(scene2, Y, 90);
-        break;
-      case 1:
-        transitionWipe(scene2, X, 15);
-        break;
-      case 2:
-        transitionDissolve(scene1, scene2);
-        break;
-      case 3:
-        fillScene(scene1, 0xa800ff); // dissolve from white
-        transitionDissolve(scene1, scene2);
-        break;
-      case 4:
-        aiColorSparkle(scene1, 50);
-        doDelay = false;
-        break;
-    }
+  /**
+   * Resets this animator to its initial settings so it can be used again. This method
+   * is also called before first use to ensure consistent behaviour.
+   */
+  virtual void reset() {
+    frameDelay = 0;
+    keepRunning = true;
+  }
+};
 
-    // stay on the logo for a while
-    if (delay) {
-      delay(15000);
+class CompoundAnim : public PixelAnimator {
+  private:
+  uint8_t nAnimators;
+  uint8_t currentAnimator{0};
+  PixelAnimator **animators;
+  
+  public:
+  CompoundAnim(PixelAnimator *animators[], uint8_t nAnimators)
+    : PixelAnimator{0}
+    , animators{animators}
+    , nAnimators{nAnimators}
+  {}
+
+  virtual bool update(uint32_t *scene) {
+    if (!animators[currentAnimator % nAnimators]->nextFrame(scene)) {
+      currentAnimator++;
+      if (currentAnimator >= nAnimators) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  virtual void reset() {
+    PixelAnimator::reset();
+    currentAnimator = 0;
+    for (int i = 0; i < nAnimators; i++) {
+      animators[i]->reset();
     }
   }
-}
+};
 
-
-// Some functions of our own for creating animated effects -----------------
 
 // Fill strip pixels one after another with a color. Strip is NOT cleared
 // first; anything there will be covered pixel by pixel. Pass in color
 // (as a single 'packed' 32-bit value, which you can get by calling
 // strip.Color(red, green, blue) as shown in the loop() function above),
 // and a delay time (in milliseconds) between pixels.
-void seriesFill(uint32_t *scene, uint32_t hsv, int wait) {
-  for (int i = 0; i < LED_COUNT; i++) {
-    scene[i] = hsv;
-    showScene(scene);
-    delay(wait);
-    
-    if (Serial.available() > 0) {
-      return;
+class SeriesFill : public PixelAnimator {
+  private:
+  const uint32_t hsv;
+  uint8_t nextLed{0};
+
+  public:
+  SeriesFill(uint32_t hsv, uint8_t frameSkip)
+    : hsv{hsv}
+    , PixelAnimator{frameSkip}
+  {}
+
+  virtual bool update(uint32_t *scene) {
+    scene[nextLed % LED_COUNT] = hsv;
+    nextLed++;
+    if (nextLed >= LED_COUNT) {
+      // Serial.print("SeriesFill got to pixel ");
+      // Serial.println(nextLed);
+      return false;
     }
+    return true;
   }
-}
+
+  virtual void reset() {
+    Serial.println("SeriesFill reset");
+    PixelAnimator::reset();
+    nextLed = 0;
+  }
+};
 
 // Rainbow cycle along whole strip. Pass delay time (in ms) between frames.
-void rainbow(uint32_t *scene, int wait) {
-  for (uint32_t firstPixelHue = 0; firstPixelHue < 3 * 255; firstPixelHue++) {
+class Rainbow : public PixelAnimator {
+  private:
+  uint32_t firstPixelHue{0};
+
+  public:
+  Rainbow(uint8_t frameSkip)
+    : PixelAnimator{frameSkip}
+    {}
+
+  virtual bool update(uint32_t *scene) {
     for (int i = 0; i < LED_COUNT; i++) {
-      // hue of pixel 'i' is offset by an amount to make one full
-      // revolution of the color wheel (range 255) along the length
-      // of the strip
       uint32_t hue = firstPixelHue + i * 255L / LED_COUNT;
       scene[i] = (hue << 16) | 0xffff;
-      // Serial.print("i=");
-      // Serial.print(i);
-      // Serial.print(" hue=");
-      // Serial.print(hue, 16);
-      // Serial.print(" scene[i]=");
-      // Serial.println(scene[i], 16);
     }
-
-    showScene(scene);
-    delay(wait);
-
-    if (Serial.available() > 0) {
-      return;
-    }
+    firstPixelHue++;
+    return firstPixelHue < 3 * 255;
   }
-}
 
-void aiColorSparkle(uint32_t *scene, int wait) {
-  int firstPixelHue = 0;
-  for(int a = 0; a < 30; a++) {
-    fillSceneAi(scene, 0);
-    for (int c = OMICS_LAST_LED + 1; c < LED_COUNT; c++) {
-      uint32_t hue = firstPixelHue + c * 255 / (LED_COUNT - OMICS_LAST_LED);
+  virtual void reset() {
+    PixelAnimator::reset();
+    firstPixelHue = 0;
+  }
+};
+
+class ColorSparkle : public PixelAnimator {
+  const uint8_t firstLed;
+  const uint8_t lastLed;
+  uint16_t firstPixelHue{0};
+  int16_t ttl{40};
+
+  public:
+  ColorSparkle(uint8_t firstLed, uint8_t lastLed, int frameSkip)
+    : firstLed{firstLed}
+    , lastLed{lastLed}
+    , PixelAnimator{frameSkip}
+    {}
+
+  virtual bool update(uint32_t *scene) {
+    for (uint8_t c = firstLed; c < lastLed; c++) {
+      uint32_t hue = firstPixelHue + c * 255 / (lastLed - firstLed);
       scene[c] = (hue << 16) | 0xffff;
     }
-    showScene(scene);
-    delay(wait);
     firstPixelHue += 50;
+    ttl--;
+    return ttl > 0;
   }
-}
 
-void geomFill(uint32_t *scene, const uint8_t **map, uint32_t hsv, int wait) {
-  for (int rownum = 0; map[rownum] != NULL; rownum++) {
-    uint8_t* leds = map[rownum];
+  virtual void reset() {
+    PixelAnimator::reset();
+    firstPixelHue = 0;
+    ttl = 30;
+  }
+};
+
+class GeomFill : public PixelAnimator {
+  private:
+  const uint8_t **map;
+  const uint32_t hsv;
+  uint16_t rownum{0};
+  bool done{false};
+
+  public:
+  GeomFill(const uint8_t **map, uint32_t hsv, uint8_t frameSkip)
+    : map{map}
+    , hsv{hsv}
+    , PixelAnimator{frameSkip}
+    {}
+
+  virtual bool update(uint32_t *scene) {
+    if (map[rownum] == NULL) {
+      done = true;
+      rownum = 0;        
+    }
+    uint8_t* leds = map[rownum++];
     for (int col = 0; leds[col] != ENDROW; col++) {
       scene[leds[col]] = hsv;
     }
-    showScene(scene);
-    delay(wait);
+    return !done;
   }
-}
+
+  virtual void reset() {
+    PixelAnimator::reset();
+    rownum = 0;
+    done = false;
+  }
+};
 
 void fillScene(uint32_t *scene, uint32_t colorHsv) {
   for (int i = 0; i < LED_COUNT; i++) scene[i] = colorHsv;
@@ -289,6 +344,133 @@ uint32_t lerp(uint32_t a, uint32_t b, uint8_t p) {
     (static_cast<uint32_t>(s) << 8) |
     static_cast<uint32_t>(v);
 }
+
+// Main Program -------------------------------------------------
+
+static PixelAnimator *animBgrSeriesFill;
+static PixelAnimator *animRainbow;
+static PixelAnimator *animGeomFillY;
+static PixelAnimator *animAiColorSparkle;
+
+static PixelAnimator *currentAnim = NULL;
+
+// Delay between frames. Changing this will globally alter how fast effects and transitions run.
+static const uint8_t FRAME_PERIOD = 2;
+
+// Time to wait on the logo in its proper form before starting a new animation cycle
+static const uint16_t LOGO_DWELL_MILLIS = 2000; // 15000;
+
+// two buffers for the scene, both in packed HSV 8,8,8
+uint32_t scene1[LED_COUNT];
+uint32_t scene2[LED_COUNT];
+
+enum Mode { AUTO, SINGLE };
+Mode mode = AUTO;
+
+void setup() {
+  strip.begin();
+  strip.show(); // ensure pixels don't come on at 100% white (mega power draw)
+  strip.setBrightness(50); // (max = 255)
+
+  Serial.begin(9600);
+  while (!Serial) {
+    ;  // wait for serial port to connect. Needed for native USB port only
+  }
+
+  Serial.println("creating animators");
+
+  PixelAnimator *sfComponents[3] = {
+    new SeriesFill(0xaaffff, 10), // blue
+    new SeriesFill(0x55ffff, 10), // green
+    new SeriesFill(0x00ffff, 10)  // red
+  };
+  animBgrSeriesFill = new CompoundAnim(sfComponents, 3);
+
+  animRainbow = new Rainbow(5);
+
+  PixelAnimator *gfComponents[5] = {
+    new GeomFill(Y, 0xccffff, 20),
+    new GeomFill(Y, 0x99ffff, 20),
+    new GeomFill(Y, 0x66ffff, 20),
+    new GeomFill(Y, 0x33ffff, 20),
+    new GeomFill(Y, 0x00ffff, 20)
+  };
+  animGeomFillY = new CompoundAnim(gfComponents, 5);
+
+  animAiColorSparkle = new ColorSparkle(OMICS_LAST_LED + 1, LED_COUNT, 8);
+
+  Serial.println("init() finished");
+}
+
+// ------------------------------------------
+//         MAIN LOOP
+// ------------------------------------------
+void loop() {
+  Serial.println("starting loop");
+
+  if (Serial.available() > 0) {
+    processSerial();
+  }
+
+  if (mode == AUTO) {
+    if (currentAnim == NULL) {
+      // choose random effect and run it on scene 1
+      switch (random(4)) {
+        case 0:
+          currentAnim = animRainbow;
+          break;
+        case 1:
+          currentAnim = animAiColorSparkle;
+          break;
+        case 2:
+          currentAnim = animBgrSeriesFill;
+          break;
+        case 3:
+          currentAnim = animGeomFillY;
+          break;
+      }
+      currentAnim->reset();
+    }
+
+    while (currentAnim->nextFrame(scene1)) {
+      showScene(scene1);
+      delay(FRAME_PERIOD);
+
+      if (Serial.available() > 0) {
+        break;
+      }
+    }
+
+    // TODO transition and animate simultaneously
+    // choose random wipe to reveal scene 2 (the proper logo colours)
+    fillSceneOmics(scene2, 0xa800ff);
+    fillSceneAi(scene2, AI_PURPLE_HSV);
+    switch (random(4)) {
+      case 0:
+        transitionWipe(scene2, Y, 90);
+        break;
+      case 1:
+        transitionWipe(scene2, X, 15);
+        break;
+      case 2:
+        transitionDissolve(scene1, scene2);
+        break;
+      case 3:
+        fillScene(scene1, 0xa800ff); // dissolve from white
+        transitionDissolve(scene1, scene2);
+        break;
+      // case 4:
+      //   aiColorSparkle(scene1, 50);
+      //   break;
+    }
+
+    currentAnim = NULL;
+
+    // stay on the logo for a while
+    delay(LOGO_DWELL_MILLIS);
+  }
+}
+
 
 // ------------ Serial Console stuff ------------
 int inputNumber = -1;
