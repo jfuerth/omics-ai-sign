@@ -38,6 +38,8 @@ static const uint8_t X14[3] = { 29, 31, ENDROW };
 static const uint8_t X15[4] = { 26, 27, 28, ENDROW };
 static const uint8_t X16[4] = { 32, 33, 34, ENDROW };
 static const uint8_t* X[] = { X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, NULL };
+static const uint8_t* X_REV[] = { X16, X15, X14, X13, X12, X11, X10, X9, X8, X7, X6, X5, X4, X3, X2, X1, X0, NULL };
+static const uint8_t* X_MID[] = { X0, X16, X1, X15, X2, X14, X3, X4, X13, X5, X12, X6, X11, X7, X10, X8, X9, NULL };
 
 // OMICS letters are 0..24
 static const uint8_t OMICS_LAST_LED = 24;
@@ -45,6 +47,41 @@ static const uint8_t OMICS_LAST_LED = 24;
 //static const uint32_t AI_PURPLE_HSV = 0xadc8e3; // "true" RGB is #4d51e5 = 238deg, 66%, 90% = hsv(a8,a9,e5) but this looks closer to me
 static const uint32_t AI_PURPLE_HSV = 0xa8a9e5; 
 
+// low-level functions
+uint32_t lerp(uint32_t a, uint32_t b, uint8_t p) {
+  uint8_t ah = (a >> 16) & 0xff;
+  uint8_t bh = (b >> 16) & 0xff;
+  uint8_t as = (a >> 8) & 0xff;
+  uint8_t bs = (b >> 8) & 0xff;
+  uint8_t av = a & 0xff;
+  uint8_t bv = b & 0xff;
+
+  uint8_t h = static_cast<uint8_t>((ah * (255 - p) + bh * p) / 255);
+  uint8_t s = static_cast<uint8_t>((as * (255 - p) + bs * p) / 255);
+  uint8_t v = static_cast<uint8_t>((av * (255 - p) + bv * p) / 255);
+
+  return
+    (static_cast<uint32_t>(h) << 16) |
+    (static_cast<uint32_t>(s) << 8) |
+    static_cast<uint32_t>(v);
+}
+
+void fillScene(uint32_t *scene, uint32_t colorHsv) {
+  for (int i = 0; i < LED_COUNT; i++) scene[i] = colorHsv;
+}
+void fillSceneOmics(uint32_t *scene, uint32_t colorHsv) {
+  for (int i = 0; i <= OMICS_LAST_LED; i++) scene[i] = colorHsv;
+}
+void fillSceneAi(uint32_t *scene, uint32_t colorHsv) {
+  for (int i = OMICS_LAST_LED + 1; i < LED_COUNT; i++) scene[i] = colorHsv;
+}
+void showScene(uint32_t *scene) {
+    for (int i = 0; i < LED_COUNT; i++) {
+      uint32_t hsv = scene[i];
+      strip.setPixelColor(i, strip.gamma32(strip.ColorHSV((hsv >> 8) & 0xff00, (hsv >> 8) & 0xff, hsv & 0xff)));
+    }
+    strip.show();
+}
 
 // PixelAnimator implementations -----------------
 class PixelAnimator {
@@ -96,21 +133,26 @@ class PixelAnimator {
 
 class CompoundAnim : public PixelAnimator {
   private:
-  uint8_t nAnimators;
+  const uint8_t nAnimators;
+  const uint8_t stopAt;
   uint8_t currentAnimator{0};
   PixelAnimator **animators;
   
   public:
-  CompoundAnim(PixelAnimator *animators[], uint8_t nAnimators)
+  CompoundAnim(PixelAnimator *animators[], uint8_t nAnimators, uint8_t stopAt = 0)
     : PixelAnimator{0}
     , animators{animators}
     , nAnimators{nAnimators}
+    , stopAt{stopAt == 0 ? nAnimators : stopAt}
   {}
 
   virtual bool update(uint32_t *scene) {
     if (!animators[currentAnimator % nAnimators]->nextFrame(scene)) {
+      animators[currentAnimator % nAnimators]->reset();
+      Serial.print("Resetting animator ");
+      Serial.println(currentAnimator % nAnimators);
       currentAnimator++;
-      if (currentAnimator >= nAnimators) {
+      if (currentAnimator >= stopAt) {
         return false;
       }
     }
@@ -155,7 +197,7 @@ class SeriesFill : public PixelAnimator {
   }
 
   virtual void reset() {
-    Serial.println("SeriesFill reset");
+    //Serial.println("SeriesFill reset");
     PixelAnimator::reset();
     nextLed = 0;
   }
@@ -233,7 +275,7 @@ class GeomFill : public PixelAnimator {
   virtual bool update(uint32_t *scene) {
     if (map[rownum] == NULL) {
       done = true;
-      rownum = 0;        
+      rownum = 0;
     }
     uint8_t* leds = map[rownum++];
     for (int col = 0; leds[col] != ENDROW; col++) {
@@ -249,101 +291,124 @@ class GeomFill : public PixelAnimator {
   }
 };
 
-void fillScene(uint32_t *scene, uint32_t colorHsv) {
-  for (int i = 0; i < LED_COUNT; i++) scene[i] = colorHsv;
-}
-void fillSceneOmics(uint32_t *scene, uint32_t colorHsv) {
-  for (int i = 0; i <= OMICS_LAST_LED; i++) scene[i] = colorHsv;
-}
-void fillSceneAi(uint32_t *scene, uint32_t colorHsv) {
-  for (int i = OMICS_LAST_LED + 1; i < LED_COUNT; i++) scene[i] = colorHsv;
-}
+// ---------------------------------------
+//         Transitions
+// ---------------------------------------
 
-void showScene(uint32_t *scene) {
-    for (int i = 0; i < LED_COUNT; i++) {
-      uint32_t hsv = scene[i];
-      strip.setPixelColor(i, strip.gamma32(strip.ColorHSV((hsv >> 8) & 0xff00, (hsv >> 8) & 0xff, hsv & 0xff)));
-    }
-    strip.show();
-}
+// rules for transitions
+// fromScene and toScene can both be animating
+// progress is measured from 0..255
+// targetScene should not be animating on its own
+// targetScene must not point to fromScene or toScene
+class Transition {
+  uint16_t progress{0};
+  const uint8_t frameSkip;
 
-void transitionDissolve(uint32_t *fromScene, uint32_t *toScene) {
-  // Avoid unproductive colour cycling when the "from" or "to" colour is black or white.
-  // This is accomplished by syncing the black or white pixel's hue to match the other one
-  for (int i = 0; i < LED_COUNT; i++) {
-    if ((fromScene[i] & 0x00ff00 == 0) ||  // from white
-        (fromScene[i] & 0x0000ff == 0)) {  // from black
-      fromScene[i] &= 0x00ffff;
-      fromScene[i] |= toScene[i] & 0xff0000;
+  protected:
+  Transition(uint8_t frameSkip)
+    : frameSkip(frameSkip)
+  {}
+
+  public:
+  bool nextFrame(uint32_t *fromScene, uint32_t *toScene, Adafruit_NeoPixel *targetStrip) {
+    if (progress >= 255) {
+      return false;
     }
-    if ((toScene[i]   & 0x00ff00 == 0) ||  // to white
-        (toScene[i]   & 0x0000ff == 0)) {  // to black
-      toScene[i] &= 0x00ffff;
-      toScene[i] |= fromScene[i] & 0xff0000;
-    }
+    update(progress, fromScene, toScene, targetStrip);
+    progress += frameSkip;
+    return true;
   }
 
-  const int wait = 8;
-  const int steps = 127;
-  for (int step = 0; step < steps; step++) {
-    uint8_t portion = step * 255 / steps;
-    // Serial.print("portion=");
-    // Serial.println(portion);
+  virtual void update(uint8_t progress, uint32_t *fromScene, uint32_t *toScene, Adafruit_NeoPixel *targetStrip);
+
+  virtual void reset() {
+    progress = 0;
+  }
+};
+
+class TransitionDissolve : public Transition {
+
+  public:
+  TransitionDissolve(uint8_t frameSkip)
+    : Transition(frameSkip)
+  {}
+
+  virtual void update(uint8_t progress, uint32_t *fromScene, uint32_t *toScene, Adafruit_NeoPixel *targetStrip) {
+
     for (int i = 0; i < LED_COUNT; i++) {
-      // if (i == 0 || i == OMICS_LAST_LED + 1) {
-      //   Serial.print("from=0x");
+
+      // Avoid unproductive colour cycling when the "to" colour is white.
+      // This is accomplished by syncing the target pixel's hue to match the source one
+      uint32_t toColor;
+      if ((toScene[i] & 0x00ff00) == 0) { // to white
+        toColor = (fromScene[i] & 0xff0000) | (toScene[i] & 0x00ffff);
+      } else {
+        toColor = toScene[i];
+      }
+
+      uint32_t blendedHsv = lerp(fromScene[i], toColor, progress);
+
+      // if (i == OMICS_LAST_LED+1) {
+      //   Serial.print(progress);
+      //   Serial.print(" fromScene[i] ");
       //   Serial.print(fromScene[i], 16);
-      //   Serial.print(" to=0x");
+      //   Serial.print(" toScene[i] ");
       //   Serial.print(toScene[i], 16);
-      // }
-
-      uint32_t blendedHsv = lerp(fromScene[i], toScene[i], portion);
-
-      // if (i == 0 || i == OMICS_LAST_LED + 1) {
-      //   Serial.print(" lerp=0x");
+      //   Serial.print(" toColor ");
+      //   Serial.print(toColor, 16);
+      //   Serial.print(" blended ");
       //   Serial.println(blendedHsv, 16);
       // }
 
-      strip.setPixelColor(i, strip.gamma32(strip.ColorHSV((blendedHsv >> 8) & 0xff00, (blendedHsv >> 8) & 0xff, blendedHsv & 0xff)));
+      targetStrip->setPixelColor(i, strip.gamma32(strip.ColorHSV((blendedHsv >> 8) & 0xff00, (blendedHsv >> 8) & 0xff, blendedHsv & 0xff)));
     }
-    strip.show();
-    delay(wait);
+  }
+};
+
+class TransitionNone : public Transition {
+
+  public:
+  TransitionNone(uint8_t frameSkip)
+    : Transition(frameSkip)
+  {}
+
+  virtual void update(uint8_t progress, uint32_t *fromScene, uint32_t *toScene, Adafruit_NeoPixel *targetStrip) {
+    for (int i = 0; i < LED_COUNT; i++) {
+      uint32_t blendedHsv = fromScene[i];
+      targetStrip->setPixelColor(i, strip.gamma32(strip.ColorHSV((blendedHsv >> 8) & 0xff00, (blendedHsv >> 8) & 0xff, blendedHsv & 0xff)));
+    }
   }
 
-  // show the final scene because we may not have made it all the way to 255 on the last lerp step
-  showScene(toScene);
-}
+};
 
-void transitionWipe(uint32_t *toScene, uint8_t **geometry, uint32_t frameDelay) {
-  for (int rownum = 0; geometry[rownum] != NULL; rownum++) {
-    uint8_t* leds = geometry[rownum];
-    for (int col = 0; leds[col] != ENDROW; col++) {
-      uint16_t ledIndex = leds[col];
-      uint32_t hsv = toScene[ledIndex];
-      strip.setPixelColor(ledIndex, strip.ColorHSV((hsv >> 8) & 0xff00, (hsv >> 8) & 0xff, hsv & 0xff));
+class TransitionWipe : public Transition {
+  const uint8_t **geometry;
+  uint8_t numRows;
+
+  public:
+  TransitionWipe(const uint8_t **geometry, uint8_t frameSkip)
+    : geometry{geometry}
+    , Transition(frameSkip)
+  {
+    numRows = 0;
+    while (geometry[numRows] != NULL && numRows < 255) {
+      numRows++;
     }
-    strip.show();
-    delay(frameDelay);
   }
-}
 
-uint32_t lerp(uint32_t a, uint32_t b, uint8_t p) {
-  uint8_t ah = (a >> 16) & 0xff;
-  uint8_t bh = (b >> 16) & 0xff;
-  uint8_t as = (a >> 8) & 0xff;
-  uint8_t bs = (b >> 8) & 0xff;
-  uint8_t av = a & 0xff;
-  uint8_t bv = b & 0xff;
+  virtual void update(uint8_t progress, uint32_t *fromScene, uint32_t *toScene, Adafruit_NeoPixel *targetStrip) {
+    uint8_t wiperRow = progress * numRows / 256;
+    for (int rownum = 0; geometry[rownum] != NULL; rownum++) {
+      uint8_t* leds = geometry[rownum];
+      for (int col = 0; leds[col] != ENDROW; col++) {
+        uint16_t ledIndex = leds[col];
+        uint32_t hsv = rownum < wiperRow ? toScene[ledIndex] : fromScene[ledIndex];
+        targetStrip->setPixelColor(ledIndex, strip.gamma32(strip.ColorHSV((hsv >> 8) & 0xff00, (hsv >> 8) & 0xff, hsv & 0xff)));
+      }
+    }
+  }
+};
 
-  uint8_t h = static_cast<uint8_t>((ah * (255 - p) + bh * p) / 255);
-  uint8_t s = static_cast<uint8_t>((as * (255 - p) + bs * p) / 255);
-  uint8_t v = static_cast<uint8_t>((av * (255 - p) + bv * p) / 255);
-
-  return
-    (static_cast<uint32_t>(h) << 16) |
-    (static_cast<uint32_t>(s) << 8) |
-    static_cast<uint32_t>(v);
-}
 
 // Main Program -------------------------------------------------
 
@@ -351,14 +416,23 @@ static PixelAnimator *animBgrSeriesFill;
 static PixelAnimator *animRainbow;
 static PixelAnimator *animGeomFillY;
 static PixelAnimator *animAiColorSparkle;
+static PixelAnimator *animAccelerateX;
+
+static Transition *transitionDissolve = new TransitionDissolve(1);
+static Transition *transitionWipeX = new TransitionWipe(X, 2);
+static Transition *transitionWipeXReverse = new TransitionWipe(X_REV, 2);
+static Transition *transitionWipeXMiddle = new TransitionWipe(X_MID, 2);
+static Transition *transitionWipeY = new TransitionWipe(Y, 2);
+static Transition *transitionNone = new TransitionNone(1);
 
 static PixelAnimator *currentAnim = NULL;
+static Transition *transition = NULL;
 
 // Delay between frames. Changing this will globally alter how fast effects and transitions run.
 static const uint8_t FRAME_PERIOD = 2;
 
 // Time to wait on the logo in its proper form before starting a new animation cycle
-static const uint16_t LOGO_DWELL_MILLIS = 2000; // 15000;
+static const uint16_t LOGO_DWELL_MILLIS = 15000;
 
 // two buffers for the scene, both in packed HSV 8,8,8
 uint32_t scene1[LED_COUNT];
@@ -370,7 +444,7 @@ Mode mode = AUTO;
 void setup() {
   strip.begin();
   strip.show(); // ensure pixels don't come on at 100% white (mega power draw)
-  strip.setBrightness(50); // (max = 255)
+  strip.setBrightness(100); // (max = 255)
 
   Serial.begin(9600);
   while (!Serial) {
@@ -379,25 +453,38 @@ void setup() {
 
   Serial.println("creating animators");
 
-  PixelAnimator *sfComponents[3] = {
-    new SeriesFill(0xaaffff, 10), // blue
-    new SeriesFill(0x55ffff, 10), // green
-    new SeriesFill(0x00ffff, 10)  // red
-  };
+  PixelAnimator **sfComponents = new PixelAnimator*[3];
+  sfComponents[0] = new SeriesFill(0x55ffff, 10); // green
+  sfComponents[1] = new SeriesFill(0xaaffff, 10); // blue
+  sfComponents[2] = new SeriesFill(0x00ffff, 10); // red
   animBgrSeriesFill = new CompoundAnim(sfComponents, 3);
 
   animRainbow = new Rainbow(5);
 
-  PixelAnimator *gfComponents[5] = {
-    new GeomFill(Y, 0xccffff, 20),
-    new GeomFill(Y, 0x99ffff, 20),
-    new GeomFill(Y, 0x66ffff, 20),
-    new GeomFill(Y, 0x33ffff, 20),
-    new GeomFill(Y, 0x00ffff, 20)
-  };
+  PixelAnimator **gfComponents = new PixelAnimator*[5];
+  gfComponents[0] = new GeomFill(Y, 0xccffff, 20);
+  gfComponents[1] = new GeomFill(Y, 0x99ffff, 20);
+  gfComponents[2] = new GeomFill(Y, 0x66ffff, 20);
+  gfComponents[3] = new GeomFill(Y, 0x33ffff, 20);
+  gfComponents[4] = new GeomFill(Y, 0x00ffff, 20);
   animGeomFillY = new CompoundAnim(gfComponents, 5);
 
   animAiColorSparkle = new ColorSparkle(OMICS_LAST_LED + 1, LED_COUNT, 8);
+
+  PixelAnimator **aaxComponents = new PixelAnimator*[12];
+  aaxComponents[0] = new GeomFill(X_REV, 0xccffff, 10);
+  aaxComponents[1] = new GeomFill(X_REV, 0x99ffff, 9);
+  aaxComponents[2] = new GeomFill(X_REV, 0x66ffff, 8);
+  aaxComponents[3] = new GeomFill(X_REV, 0x33ffff, 7);
+  aaxComponents[4] = new GeomFill(X_REV, 0x00ffff, 6);
+  aaxComponents[5] = new GeomFill(X_REV, 0xccffff, 5);
+  aaxComponents[6] = new GeomFill(X_REV, 0x99ffff, 4);
+  aaxComponents[7] = new GeomFill(X_REV, 0x66ffff, 3);
+  aaxComponents[8] = new GeomFill(X_REV, 0x33ffff, 2);
+  aaxComponents[9] = new GeomFill(X_REV, 0x00ffff, 1);
+  aaxComponents[10] = new GeomFill(X_REV, 0xccffff, 1);
+  aaxComponents[11] = new GeomFill(X_REV, 0x99ffff, 1);
+  animAccelerateX = new CompoundAnim(aaxComponents, 12, 8);
 
   Serial.println("init() finished");
 }
@@ -415,7 +502,7 @@ void loop() {
   if (mode == AUTO) {
     if (currentAnim == NULL) {
       // choose random effect and run it on scene 1
-      switch (random(4)) {
+      switch (random(5)) {
         case 0:
           currentAnim = animRainbow;
           break;
@@ -427,6 +514,9 @@ void loop() {
           break;
         case 3:
           currentAnim = animGeomFillY;
+          break;
+        case 4:
+          currentAnim = animAccelerateX;
           break;
       }
       currentAnim->reset();
@@ -441,30 +531,44 @@ void loop() {
       }
     }
 
-    // TODO transition and animate simultaneously
     // choose random wipe to reveal scene 2 (the proper logo colours)
     fillSceneOmics(scene2, 0xa800ff);
     fillSceneAi(scene2, AI_PURPLE_HSV);
-    switch (random(4)) {
+    switch (random(5)) {
       case 0:
-        transitionWipe(scene2, Y, 90);
+        transition = transitionWipeY;
         break;
       case 1:
-        transitionWipe(scene2, X, 15);
+        transition = transitionWipeX;
         break;
       case 2:
-        transitionDissolve(scene1, scene2);
+        transition = transitionWipeXReverse;
         break;
       case 3:
-        fillScene(scene1, 0xa800ff); // dissolve from white
-        transitionDissolve(scene1, scene2);
+        transition = transitionWipeXMiddle;
         break;
-      // case 4:
-      //   aiColorSparkle(scene1, 50);
-      //   break;
+      case 4:
+        transition = transitionDissolve;
+        break;
+    }
+    transition->reset();
+
+    while (transition->nextFrame(scene1, scene2, &strip)) {
+      currentAnim->nextFrame(scene1);
+      strip.show();
+      delay(FRAME_PERIOD);
+    }
+
+    // Ensure we land on the final desired scene (rounding errors in transitions could leave us close but not exact)
+    showScene(scene2);
+
+    // copy scene2 back to scene1 because not all animations replace all pixels right away
+    for (int i = 0; i < LED_COUNT; i++) {
+      scene1[i] = scene2[i];
     }
 
     currentAnim = NULL;
+    transition = NULL;
 
     // stay on the logo for a while
     delay(LOGO_DWELL_MILLIS);
